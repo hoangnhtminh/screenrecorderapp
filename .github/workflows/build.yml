@@ -1,1 +1,28 @@
+name: Build EXE
 
+on: [push]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyaudio mss opencv-python soundcard numpy pyinstaller
+
+      - name: Build EXE
+        run: python -m PyInstaller --onefile --windowed --name "ScreenRecorder" --hidden-import pyaudio --hidden-import soundcard --hidden-import mss --hidden-import cv2 screen_recorder.py
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenRecorder
+          path: dist/ScreenRecorder.exe
