@@ -8,7 +8,7 @@
 """
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 import threading
 import time
 import os
@@ -309,7 +309,7 @@ class VideoRecorder:
                 if remaining > 0:
                     time.sleep(remaining)
 
-    def save(self, path: str, p720: bool = True) -> bool:
+    def save(self, path: str, p720: bool = True, progress_cb=None) -> bool:
         """Write frames to MP4. Returns True on success."""
         if not self._frames:
             return False
@@ -324,13 +324,17 @@ class VideoRecorder:
 
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             writer = cv2.VideoWriter(path, fourcc, self.fps, (ow, oh))
-
-            for frame in self._frames:
+            total = len(self._frames)
+            for i, frame in enumerate(self._frames):
                 if ow != w0 or oh != h0:
                     frame = cv2.resize(frame, (ow, oh),
                                        interpolation=cv2.INTER_LANCZOS4)
                 writer.write(frame)
+                if progress_cb and i % 10 == 0:
+                    progress_cb(int(i / total * 100))
             writer.release()
+            if progress_cb:
+                progress_cb(100)
             return True
         except Exception as e:
             print(f'[VIDEO SAVE] {e}')
@@ -751,16 +755,21 @@ class App(tk.Tk):
             messagebox.showwarning('Nothing to save', 'No frames were recorded.')
             return
 
-        save_dir = filedialog.askdirectory(title='Choose folder to save recording')
-        if not save_dir:
-            return
+        # Auto-save to Desktop (or Videos folder if Desktop not found)
+        desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+        if not os.path.isdir(desktop):
+            desktop = os.path.join(os.path.expanduser('~'), 'Videos')
+            if not os.path.isdir(desktop):
+                desktop = os.path.expanduser('~')
 
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        out_path = os.path.join(save_dir, f'recording_{ts}.mp4')
+        out_path = os.path.join(desktop, f'recording_{ts}.mp4')
 
-        self._status_lbl.config(text='SAVING…', fg=self.ACCENT)
+        # Show progress bar in status area
+        self._progress_var = tk.IntVar(value=0)
+        self._status_lbl.config(text='SAVING…  0%', fg=self.ACCENT)
         self._btn_save.config(state='disabled', bg='#222', fg=self.MUTED)
-        self.update_idletasks()
+        self._btn_start.config(state='disabled', bg='#222', fg=self.MUTED)
 
         threading.Thread(
             target=self._do_save,
@@ -768,26 +777,37 @@ class App(tk.Tk):
             daemon=True
         ).start()
 
+    def _update_progress(self, pct: int):
+        """Called from save thread via after() — updates status label."""
+        self.after(0, lambda p=pct: self._status_lbl.config(
+            text=f'SAVING…  {p}%', fg=self.ACCENT
+        ))
+
     def _do_save(self, final_path: str):
         tmp = tempfile.mkdtemp(prefix='screenrec_')
         try:
             v_tmp = os.path.join(tmp, 'video.mp4')
             a_tmp = os.path.join(tmp, 'audio.wav')
 
-            # Save raw video
-            ok_v = self.vid.save(v_tmp, p720=True)
+            # Save video with progress updates
+            ok_v = self.vid.save(
+                v_tmp, p720=True,
+                progress_cb=self._update_progress
+            )
             if not ok_v:
                 self.after(0, lambda: self._save_done(False, ''))
                 return
 
             # Save audio
+            self.after(0, lambda: self._status_lbl.config(
+                text='SAVING…  audio', fg=self.ACCENT))
             ok_a = self.aud.save_wav(a_tmp)
 
             if ok_a:
-                # Try to merge with ffmpeg
+                self.after(0, lambda: self._status_lbl.config(
+                    text='SAVING…  merging', fg=self.ACCENT))
                 merged = merge_video_audio(v_tmp, a_tmp, final_path)
                 if not merged:
-                    # ffmpeg not found or failed → keep silent video
                     shutil.copy2(v_tmp, final_path)
             else:
                 shutil.copy2(v_tmp, final_path)
@@ -801,12 +821,14 @@ class App(tk.Tk):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def _save_done(self, ok: bool, path: str):
+        self._btn_start.config(state='normal', bg=self.ACCENT, fg='#000')
         if ok:
             self._status_lbl.config(text='SAVED ✓', fg=self.ACCENT)
-            self._toast('✅  Recording saved!',
-                        f'{os.path.basename(path)}\n{path}')
+            self._toast('✅  Saved!',
+                        f'Folder: {os.path.dirname(path)}\nFile: {os.path.basename(path)}')
         else:
             self._status_lbl.config(text='ERROR', fg=self.DANGER)
+            self._btn_save.config(state='normal', bg=self.BLUE, fg='#fff')
             messagebox.showerror('Error', 'Failed to save the recording.')
 
     # ── state helpers ─────────────────────────────────────────────────────────
