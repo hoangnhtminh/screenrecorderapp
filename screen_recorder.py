@@ -64,7 +64,6 @@ if _HAS_SOUNDCARD:
 # ─── Config ──────────────────────────────────────────────────────────────────
 AUDIO_RATE    = 44100
 AUDIO_CHUNK   = 1024
-AUDIO_CH      = 2
 VIDEO_FPS     = 20
 
 
@@ -154,19 +153,56 @@ class RegionSelector:
 class AudioRecorder:
     def __init__(self):
         self._pa = pyaudio.PyAudio()
-        self._mic_frames: list[bytes] = []
-        self._sys_frames: list[bytes] = []
-        self._recording = False
-        self._threads: list[threading.Thread] = []
-        self.has_system_audio = _HAS_SOUNDCARD
+        self._mic_frames:  list[bytes] = []
+        self._sys_frames:  list[bytes] = []
+        self._recording    = False
+        self._threads:     list[threading.Thread] = []
 
-        # Verify mic is accessible
-        self.has_mic = False
+        # ── Detect mic ────────────────────────────────────────────────────────
+        self.has_mic  = False
+        self._mic_idx = None
+        self._mic_ch  = 1
         try:
             info = self._pa.get_default_input_device_info()
-            self.has_mic = (info is not None)
+            if info:
+                self.has_mic  = True
+                self._mic_idx = int(info['index'])
+                # Use stereo if available, else mono
+                self._mic_ch  = min(int(info['maxInputChannels']), 2)
         except Exception:
             pass
+
+        # ── Detect WASAPI loopback for system audio ───────────────────────────
+        self.has_system_audio = False
+        self._loop_idx        = None
+        self._loop_ch         = 2
+        self._wasapi_info     = None
+        try:
+            wasapi = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_out_idx = int(wasapi['defaultOutputDevice'])
+            dev = self._pa.get_device_info_by_index(default_out_idx)
+            # Activate as loopback input
+            if dev.get('maxInputChannels', 0) == 0:
+                # Need loopback flag — find via name match
+                for i in range(self._pa.get_device_count()):
+                    d = self._pa.get_device_info_by_index(i)
+                    if (d.get('hostApi') == wasapi['index']
+                            and d.get('maxInputChannels', 0) > 0
+                            and dev['name'] in d['name']):
+                        self._loop_idx = i
+                        self._loop_ch  = min(int(d['maxInputChannels']), 2)
+                        self.has_system_audio = True
+                        break
+            else:
+                self._loop_idx = default_out_idx
+                self._loop_ch  = min(int(dev['maxInputChannels']), 2)
+                self.has_system_audio = True
+        except Exception:
+            pass
+
+        # ── Fallback: try soundcard if WASAPI loopback not found ──────────────
+        if not self.has_system_audio and _HAS_SOUNDCARD:
+            self.has_system_audio = True
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -182,13 +218,21 @@ class AudioRecorder:
             self._threads.append(t)
 
         if self.has_system_audio:
-            t = threading.Thread(target=self._record_system, daemon=True)
-            t.start()
-            self._threads.append(t)
+            if self._loop_idx is not None:
+                t = threading.Thread(target=self._record_wasapi_loopback, daemon=True)
+            elif _HAS_SOUNDCARD:
+                t = threading.Thread(target=self._record_soundcard, daemon=True)
+            else:
+                t = None
+            if t:
+                t.start()
+                self._threads.append(t)
 
     def stop(self):
         self._recording = False
-        # Don't join — threads are daemon, they'll stop on their own
+        # Give threads up to 1s to flush last chunk (non-blocking for UI)
+        for t in self._threads:
+            t.join(timeout=1.0)
         self._threads.clear()
 
     def cleanup(self):
@@ -203,9 +247,10 @@ class AudioRecorder:
         try:
             stream = self._pa.open(
                 format=pyaudio.paInt16,
-                channels=AUDIO_CH,
+                channels=self._mic_ch,
                 rate=AUDIO_RATE,
                 input=True,
+                input_device_index=self._mic_idx,
                 frames_per_buffer=AUDIO_CHUNK,
             )
             while self._recording:
@@ -216,18 +261,42 @@ class AudioRecorder:
         except Exception as e:
             print(f'[MIC] {e}')
 
-    def _record_system(self):
+    def _record_wasapi_loopback(self):
+        """Capture system audio via WASAPI loopback device."""
         try:
-            speaker = sc.default_speaker()
+            stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=self._loop_ch,
+                rate=AUDIO_RATE,
+                input=True,
+                input_device_index=self._loop_idx,
+                frames_per_buffer=AUDIO_CHUNK,
+                as_loopback=True,   # pyaudio WASAPI flag
+            )
+            while self._recording:
+                data = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
+                self._sys_frames.append(data)
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            # as_loopback not supported on this build → try soundcard fallback
+            try:
+                self._record_soundcard()
+            except Exception as e:
+                print(f'[SYS AUDIO WASAPI] {e}')
+
+    def _record_soundcard(self):
+        """Fallback: capture system audio via soundcard loopback."""
+        try:
+            speaker  = sc.default_speaker()
             loopback = sc.get_microphone(speaker.id, include_loopback=True)
-            with loopback.recorder(samplerate=AUDIO_RATE, channels=AUDIO_CH) as rec:
+            with loopback.recorder(samplerate=AUDIO_RATE, channels=2) as rec:
                 while self._recording:
                     chunk = rec.record(numframes=AUDIO_CHUNK)
-                    # float32 → int16
                     pcm = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
                     self._sys_frames.append(pcm.tobytes())
         except Exception as e:
-            print(f'[SYS AUDIO] {e}')
+            print(f'[SYS AUDIO SC] {e}')
 
     # ── export ────────────────────────────────────────────────────────────────
 
@@ -239,19 +308,35 @@ class AudioRecorder:
             return False
 
         try:
+            def _to_stereo(raw: bytes, src_ch: int) -> np.ndarray:
+                """Convert raw PCM bytes to stereo float32 numpy array."""
+                arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                if src_ch == 1:
+                    # mono → stereo (duplicate channel)
+                    arr = np.stack([arr, arr], axis=1).flatten()
+                elif src_ch == 2:
+                    pass  # already interleaved stereo
+                return arr
+
             if has_mic and has_sys:
-                mic_np = np.frombuffer(b''.join(self._mic_frames), dtype=np.int16).astype(np.float32)
-                sys_np = np.frombuffer(b''.join(self._sys_frames), dtype=np.int16).astype(np.float32)
-                n = min(len(mic_np), len(sys_np))
-                mixed = np.clip(mic_np[:n] * 0.55 + sys_np[:n] * 0.55, -32768, 32767).astype(np.int16)
+                mic_np = _to_stereo(b''.join(self._mic_frames), self._mic_ch)
+                sys_np = _to_stereo(b''.join(self._sys_frames), self._loop_ch or 2)
+                n      = min(len(mic_np), len(sys_np))
+                mixed  = np.clip(
+                    mic_np[:n] * 0.55 + sys_np[:n] * 0.55,
+                    -32768, 32767
+                ).astype(np.int16)
                 raw = mixed.tobytes()
+                out_ch = 2
             elif has_mic:
-                raw = b''.join(self._mic_frames)
+                raw    = b''.join(self._mic_frames)
+                out_ch = self._mic_ch
             else:
-                raw = b''.join(self._sys_frames)
+                raw    = b''.join(self._sys_frames)
+                out_ch = self._loop_ch or 2
 
             with wave.open(path, 'wb') as wf:
-                wf.setnchannels(AUDIO_CH)
+                wf.setnchannels(out_ch)
                 wf.setsampwidth(2)
                 wf.setframerate(AUDIO_RATE)
                 wf.writeframes(raw)
